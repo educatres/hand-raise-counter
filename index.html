@@ -798,12 +798,13 @@
               <select id="apiProvider">
                 <option value="cgu" selected>長庚 CGU LLM API</option>
                 <option value="openai">OpenAI API</option>
+                <option value="google">Google AI Studio / Gemini API</option>
                 <option value="custom">自定義 endpoint</option>
               </select>
             </div>
             <div class="field endpoint-field">
               <label for="apiEndpoint">Endpoint</label>
-              <input id="apiEndpoint" type="url" autocomplete="off" spellcheck="false" value="https://air.cgu.edu.tw/cgullmapi/v1" placeholder="https://api.openai.com/v1 或完整 /responses URL">
+              <input id="apiEndpoint" type="url" autocomplete="off" spellcheck="false" value="https://air.cgu.edu.tw/cgullmapi/v1" placeholder="https://api.openai.com/v1、/responses URL 或 Gemini endpoint">
             </div>
             <div class="field">
               <label for="apiKey">API key / Authorization</label>
@@ -813,6 +814,9 @@
               <label for="model">模型</label>
               <input id="model" type="text" list="modelOptions" autocomplete="off" spellcheck="false" value="gpt-5.4-mini" placeholder="輸入模型名稱">
               <datalist id="modelOptions">
+                <option value="gemini-2.5-flash"></option>
+                <option value="gemini-2.5-flash-lite"></option>
+                <option value="gemini-2.5-pro"></option>
                 <option value="gpt-5.5"></option>
                 <option value="gpt-5.4"></option>
                 <option value="gpt-5.4-mini"></option>
@@ -926,17 +930,26 @@
       cgu: {
         label: "長庚 CGU LLM API",
         endpoint: "https://air.cgu.edu.tw/cgullmapi/v1",
-        model: "gpt-5.4-mini"
+        model: "gpt-5.4-mini",
+        apiStyle: "responses"
       },
       openai: {
         label: "OpenAI API",
         endpoint: "https://api.openai.com/v1",
-        model: "gpt-5.5"
+        model: "gpt-5.5",
+        apiStyle: "responses"
+      },
+      google: {
+        label: "Google AI Studio / Gemini API",
+        endpoint: "https://generativelanguage.googleapis.com/v1beta/interactions",
+        model: "gemini-2.5-flash",
+        apiStyle: "gemini"
       },
       custom: {
         label: "自定義 endpoint",
         endpoint: "",
-        model: ""
+        model: "",
+        apiStyle: "responses"
       }
     };
 
@@ -1102,18 +1115,27 @@
         : `${withoutTrailingSlash}/responses`;
     }
 
+    function normalizeRawEndpoint(endpoint) {
+      return endpoint.trim().replace(/\/+$/, "");
+    }
+
     function formatAuthorization(apiKey) {
       return /^Bearer\s+/i.test(apiKey) ? apiKey : `Bearer ${apiKey}`;
     }
 
     function requireApiSettings() {
       const provider = getProviderConfig();
-      const endpoint = normalizeResponsesEndpoint(els.apiEndpoint.value);
+      const apiStyle = provider.apiStyle || "responses";
+      const endpoint = apiStyle === "responses"
+        ? normalizeResponsesEndpoint(els.apiEndpoint.value)
+        : normalizeRawEndpoint(els.apiEndpoint.value);
       const apiKey = els.apiKey.value.trim();
       const model = els.model.value.trim();
 
       if (!endpoint) {
-        setStatus("請先輸入 API endpoint。可以填 base URL，系統會自動接上 /responses。", "error");
+        setStatus(apiStyle === "responses"
+          ? "請先輸入 API endpoint。可以填 base URL，系統會自動接上 /responses。"
+          : "請先輸入 Gemini API endpoint。", "error");
         return null;
       }
       if (!apiKey) {
@@ -1127,8 +1149,10 @@
 
       return {
         providerLabel: provider.label,
+        apiStyle,
         endpoint,
-        authorization: formatAuthorization(apiKey),
+        apiKey,
+        authorization: apiStyle === "responses" ? formatAuthorization(apiKey) : "",
         model
       };
     }
@@ -1271,7 +1295,18 @@
       return els.canvas.toDataURL("image/jpeg", 0.75);
     }
 
-    function buildPayload(imageDataUrl, apiSettings) {
+    function parseImageDataUrl(imageDataUrl) {
+      const match = imageDataUrl.match(/^data:([^;]+);base64,(.+)$/);
+      if (!match) {
+        throw new Error("照片資料格式不正確。");
+      }
+      return {
+        mimeType: match[1],
+        base64Data: match[2]
+      };
+    }
+
+    function buildResponsesPayload(imageDataUrl, apiSettings) {
       return {
         model: apiSettings.model,
         store: false,
@@ -1294,6 +1329,35 @@
           }
         }
       };
+    }
+
+    function buildGeminiPayload(imageDataUrl, apiSettings) {
+      const image = parseImageDataUrl(imageDataUrl);
+      return {
+        model: apiSettings.model,
+        input: [
+          { type: "text", text: `${systemPrompt}\n\n${userPrompt}` },
+          {
+            type: "image",
+            data: image.base64Data,
+            mime_type: image.mimeType
+          }
+        ],
+        response_format: {
+          type: "text",
+          mime_type: "application/json",
+          schema: analysisSchema
+        },
+        generation_config: {
+          thinking_level: "minimal"
+        }
+      };
+    }
+
+    function buildPayload(imageDataUrl, apiSettings) {
+      return apiSettings.apiStyle === "gemini"
+        ? buildGeminiPayload(imageDataUrl, apiSettings)
+        : buildResponsesPayload(imageDataUrl, apiSettings);
     }
 
     function extractOutputText(responseJson) {
@@ -1331,12 +1395,19 @@
     async function callVisionApi(imageDataUrl, apiSettings, signal) {
       let response;
       try {
+        const headers = apiSettings.apiStyle === "gemini"
+          ? {
+              "x-goog-api-key": apiSettings.apiKey,
+              "Content-Type": "application/json"
+            }
+          : {
+              "Authorization": apiSettings.authorization,
+              "Content-Type": "application/json"
+            };
+
         response = await fetch(apiSettings.endpoint, {
           method: "POST",
-          headers: {
-            "Authorization": apiSettings.authorization,
-            "Content-Type": "application/json"
-          },
+          headers,
           signal,
           body: JSON.stringify(buildPayload(imageDataUrl, apiSettings))
         });
